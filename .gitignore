@@ -1,3 +1,39 @@
+# Data files
+*.json
+*.gz
+*.csv
+
+# Data directories
+
+**/raw/
+# Local .terraform directories (plugins and downloaded modules)
+**/.terraform/*
+
+# .tfstate files (contain plain-text secrets and full cloud state)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Variables files (contain project IDs, environments, and secrets)
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Credentials and keys (GCP service account keys)
+*.json.key
+credentials.json
+USER_KEY.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
