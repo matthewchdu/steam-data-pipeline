@@ -13,10 +13,10 @@ resource "google_storage_bucket" "steam_data_bucket" {
     #Security, prevents public access to my bucket
     public_access_prevention = "enforced"
 
-    #Deletes after 30 days
+    #Deletes after set lifecycle days
     lifecycle_rule {
       condition {
-        age = 30
+        age = var.lifecycle_days
         matches_prefix = ["temp/"]
       }
       action {
@@ -64,6 +64,12 @@ resource "google_project_iam_member" "project_iam" {
   
 }
 
+resource "google_project_iam_member" "bigquery_read_session" {
+  project = var.project_name
+  role    = "roles/bigquery.readSessionUser"
+  member  = "serviceAccount:${google_service_account.account.email}"
+}
+
 resource "google_storage_bucket_iam_member" "bucket_iam" {
   # READ/WRITE/DELETE access for the data bucket
   # needed for ingestion scripts and pyspark for raw .json and temporary partitions
@@ -95,9 +101,10 @@ resource "google_project_service" "apis" {
   # enables APIs
   for_each = toset([
     "bigquery.googleapis.com",
-    
+    "bigquerystorage.googleapis.com",
     "storage.googleapis.com",
-    "dataproc.googleapis.com"
+    "dataproc.googleapis.com",
+    "storage.googleapis.com"
   ])
 
   project = var.project_name

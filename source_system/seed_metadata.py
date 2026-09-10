@@ -6,13 +6,16 @@ import ast
 import json
 import psycopg2
 from pathlib import Path
+from psycopg2.extras import execute_values 
 
+IP = "34.173.54.255"
+
+#Connects to Postgre database `steam_metadata` in the cloud
 def get_db_connection():
-    #Connects to a Postgre database `steam_metadata`
-    connection = psycopg2.connect("host=localhost " \
+    connection = psycopg2.connect(f"host={IP} " \
     "port=5432 " \
     "dbname=steam_metadata " \
-    "user=root " \
+    "user=postgres " \
     "password=root")
     return connection
 
@@ -40,11 +43,11 @@ def parse_and_load_data(connection,file_path):
     count = 0
 
     #Query with placeholder variables to be filled in during the for-loop
-    query = """
-    INSERT INTO games (app_name, release_date, payload)
-    VALUES (%s, %s, %s)
-    """    
+    query = "INSERT INTO games (app_name, release_date, payload) VALUES %s"
 
+    batch = []
+    batch_size = 5000
+    total_count = 0
     with gzip.open(file_path,'rt',encoding='utf-8') as file:
         for line in file:
             if not line.strip():
@@ -61,16 +64,22 @@ def parse_and_load_data(connection,file_path):
                 payload = json.dumps(temp)
 
                 #Executes query
-                cursor.execute(query, (app_name, release_date, payload))
+                batch.append((app_name, release_date, payload))
 
                 #Tracks the amount of rows executed, after 5000 rows, it commits it to the database
-                count+=1
-                if count % 5000 == 0:
+                if len(batch) >= batch_size:
+                    execute_values(cursor, query, batch)
                     connection.commit()
-                    print(f"Committed {count} rows")
+                    total_count += len(batch)
+                    print(f"Committed {total_count} rows...")
+                    batch.clear()
 
         #Final commit
-        connection.commit()
+        if batch:
+            execute_values(cursor, query, batch)
+            connection.commit()
+            total_count += len(batch)
+            print(f"Finished loading {total_count} rows total.")
         cursor.close()
         print(f"Committed {count} rows")
 

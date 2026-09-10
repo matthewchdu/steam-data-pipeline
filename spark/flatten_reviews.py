@@ -5,55 +5,45 @@ from pathlib import Path
 import subprocess
 import sys
 
+#Pyspark imports
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+
+# Error Tracing
 import traceback
 
+# Points spark's driver and executor to current python interpreter
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
+# Constant variables, must be changed
 BUCKET_NAME = "steam-data-pipeline-507614-steam-data-bucket"
 PROJECT_ID = "steam-data-pipeline-507614"
 BQ_DATASET = "bronze_dataset"
+IP = "34.173.54.255"
 
-
+# Sets up spark for steam bronze
 def init_spark():
-    spark = (
-        SparkSession.builder
-        .appName("SteamBronze")
-        .master("local[*]")
-        .config("spark.driver.host", "127.0.0.1")
-        .config(
-            "spark.jars.packages",
-            "org.postgresql:postgresql:42.7.3,"
-            "com.google.cloud.spark:spark-3.5-bigquery:0.36.0,"
-            "com.google.cloud.bigdataoss:gcs-connector:hadoop3-2.2.22"
-        )
-        .config("spark.hadoop.fs.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem")
-        .config("spark.hadoop.fs.AbstractFileSystem.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS")
-        .config("spark.driver.memory", "6g")
-        .config("spark.executor.memory", "6g")
-        .getOrCreate()
-    )
+    spark = SparkSession.builder.appName("SteamBronze").getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     return spark
 
-
+# Connects to the Postgre database using JDBC in the cloud and loads the database
 def load_postgres_games(spark):
     return (
         spark.read.format("jdbc")
-        .option("url", "jdbc:postgresql://localhost:5432/steam_metadata")
+        .option("url", f"jdbc:postgresql://{IP}:5432/steam_metadata")
         .option("dbtable", "games")
-        .option("user", "root")
+        .option("user", "postgres")
         .option("password", "root")
         .option("driver", "org.postgresql.Driver")
         .load()
     )
 
-
+# Loads reviews file from GCS bucket and parses it
 def load_raw_reviews(spark, file_path):
-
+    # Sets the schema
     reviews_schema = T.StructType([
     T.StructField("date", T.StringType(), True),
     T.StructField("early_access", T.BooleanType(), True),
@@ -66,47 +56,34 @@ def load_raw_reviews(spark, file_path):
     T.StructField("username", T.StringType(), True),
     ])
 
+    #RDD necessary since the file is not in valid JSON
+    #The file is in Python2 format
     rdd = (
     spark.sparkContext.textFile(file_path)
-    .repartition(64)                    
-    .map(safe_parse)                    
-    .filter(lambda row: row is not None)
+    .repartition(64) #Allows 64 cores to process each safe_parse        
+    .map(safe_parse) # .map = runs it on each line
+    .filter(lambda row: row is not None) #Empty filter
     )
 
+    # Converts RDD into DF following the target schema
     return spark.createDataFrame(rdd, schema=reviews_schema)
-
-
 
 def safe_parse(line):
     line = line.strip()
+
     if not line:
+        #Returns None if line is empty
         return None
     try:
+        # json.loads() doesn't work here, ast.literal_eval needed to turn it into a Python dictionary
         parsed = ast.literal_eval(line)
+        # If the record isn't corructed it returns the data
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None
 
-
-def shutdown():
-    subprocess.run("taskkill /F /IM java.exe /T", shell=True, capture_output=True)
-    os._exit(0)
-
-## {"id": "774276", 
-# "url": "http://store.steampowered.com/app/774276/SNOW__All_Access_Basic_Pass/", 
-## "tags": ["Free to Play", "Indie", "Simulation", "Sports"], 
-## "price": 9.99, 
-## "specs": ["Single-player", "Multi-player", "Online Multi-Player", "Cross-Platform Multiplayer", "Downloadable Content", "Steam Achievements", "Full controller support", "Steam Trading Cards", "In-App Purchases", "Steam Cloud", "Steam Leaderboards"], 
-## "title": "SNOW - All Access Basic Pass", 
-## "genres": ["Free to Play", "Indie", "Simulation", "Sports"], 
-## "app_name": "SNOW - All Access Basic Pass", 
-## "developer": "Poppermost Productions", 
-# "reviews_url": "http://steamcommunity.com/app/774276/reviews/?browsefilter=mostrecent&p=1", 
-## "early_access": false, 
-## "release_date": "2018-01-04"}
-
 def payload_to_table(postgres_df):
-
+    #Schema
     games_schema = T.StructType([
         T.StructField("id", T.StringType(), True),               
         T.StructField("title", T.StringType(), True),
@@ -121,12 +98,18 @@ def payload_to_table(postgres_df):
         T.StructField("url", T.StringType(), True),
         T.StructField("reviews_url", T.StringType(), True),
     ])
+
+    # Turns payload into DF from the schema, it then unpacks using the alias
     return postgres_df.select(
         F.from_json(F.col("payload"), games_schema).alias("data")
     ).select("data.*")
 
+# Cleaning up the data in the "games" table
 def transform_games(spark,games_df):
+    # Necessary confirm for coalesce logic
     spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
+
+    # Nulls invalid data, all "free" values are turned to decimal
     clean_price = F.regexp_replace(F.col("price"), r"[^0-9.]", "")
     games_df = games_df.withColumn(
         "price",
@@ -136,6 +119,7 @@ def transform_games(spark,games_df):
          .cast(T.DecimalType(10, 2))
     )
 
+    # Turns null titles into app_name if it has it
     is_invalid_title = (
         F.col("title").isNull() | 
         (F.trim(F.col("title")) == "") | 
@@ -146,6 +130,7 @@ def transform_games(spark,games_df):
         F.when(is_invalid_title, F.col("app_name")).otherwise(F.col("title"))
     )
 
+    #Parses release_dates, only allows precise data
     games_df = games_df.withColumn(
         "release_date",
         F.coalesce(
@@ -158,23 +143,26 @@ def transform_games(spark,games_df):
         )
     )
 
+    #Further filtering, deleting duplicate and null entries
     games_df = games_df.withColumn("id", F.trim(F.col("id")))
     games_df = games_df.dropDuplicates(["id"])
     games_df = games_df.filter(F.col("id").isNotNull())
 
-    games_df.printSchema()
-
     return games_df
 
+#Cleans up the data in the "reviews" table
 def transform_reviews(spark,reviews_df):
+    # Necessary confirm for coalesce logic
     spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
 
+    #Gets rid of empty reviews
     is_valid_text = F.col("text").isNotNull() & (F.length(F.trim(F.col("text"))) > 0)
-
     reviews_df = reviews_df.filter(is_valid_text)
 
+    # Gets rid of duplicates
     reviews_df = reviews_df.dropDuplicates(["username","product_id"])
 
+    #Casts the data
     reviews_df = reviews_df.withColumn("date", F.to_date("date", "yyyy-MM-dd"))
     reviews_df = reviews_df.withColumn("page", F.col("page").cast("int"))
     reviews_df = reviews_df.withColumn("page_order", F.col("page_order").cast("int"))
@@ -191,14 +179,18 @@ def main():
     spark = init_spark()
 
     try:
-        postgres_df = load_postgres_games(spark)
 
-        review_file_path = f"gs://{BUCKET_NAME}/raw/steam_reviews.json.gz"
-
+        # Load and tranform "reviews" table
+        review_file_path = f"gs://{BUCKET_NAME}/steam_reviews.json.gz"
         reviews_df = load_raw_reviews(spark, review_file_path)
+        reviews_df = transform_reviews(spark,reviews_df)
+
+        # Load and transform "games" table
+        postgres_df = load_postgres_games(spark)
         games_df = payload_to_table(postgres_df)
         games_df = transform_games(spark,games_df)
 
+        #Write "games" to BigQuery
         games_df.write \
             .format("bigquery") \
             .option("table", f"{PROJECT_ID}.{BQ_DATASET}.games") \
@@ -206,6 +198,7 @@ def main():
             .mode("overwrite") \
             .save()
 
+        #Write "reviews" to BigQuery
         reviews_df.write \
             .format("bigquery") \
             .option("table", f"{PROJECT_ID}.{BQ_DATASET}.reviews") \
@@ -213,18 +206,16 @@ def main():
             .mode("overwrite") \
             .save()
 
-
-
-        
-
-
+    # Used for debugging
     except Exception as e:
         print("\n" + "="*50)
         print("ERROR:")
         traceback.print_exc()
         print("="*50 + "\n")
+
+    # Termination
     finally:
-        shutdown()
+        spark.stop()
 
 
 if __name__ == "__main__":

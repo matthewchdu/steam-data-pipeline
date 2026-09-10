@@ -9,7 +9,12 @@ variable "project_name" {
   default = "steam-data-pipeline-507614"
 }
 
-
+variable "lifecycle_days" {
+  description = "Amount of days for the terraform infrastructure to stay up before deletion"
+  type = number
+  default = 30
+  
+}
 
 variable "bq_bronze_dataset" {
   description = "The name of the dataset containing raw and intermediate data"

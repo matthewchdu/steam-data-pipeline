@@ -33,7 +33,7 @@ terraform.rc
 # Credentials and keys (GCP service account keys)
 *.json.key
 credentials.json
-USER_KEY.json
+SERVICE_ACC_KEY.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
