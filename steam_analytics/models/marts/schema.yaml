@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: dim_games
+    columns:
+      - name: app_id
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_users
+    columns:
+      - name: user_id
+        tests:
+          - unique
+          - not_null
+      - name: library_size_tier
+        tests:
+          - accepted_values:
+              values: 
+                - '0 Games / Private Profile'
+                - 'Casual (<10)'
+                - 'Core Gamer (10-100)'
+                - 'Collector (100+)'
+
+  - name: fct_reviews
+    columns:
+      - name: review_id
+        tests:
+          - unique
+          - not_null
+      - name: playtime_hours
+        tests:
+          - not_null

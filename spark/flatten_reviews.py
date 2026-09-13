@@ -83,7 +83,6 @@ def safe_parse(line):
         return None
 
 def payload_to_table(postgres_df):
-    #Schema
     games_schema = T.StructType([
         T.StructField("id", T.StringType(), True),               
         T.StructField("title", T.StringType(), True),
@@ -92,14 +91,13 @@ def payload_to_table(postgres_df):
         T.StructField("price", T.StringType(), True),    
         T.StructField("release_date", T.StringType(), True),      
         T.StructField("early_access", T.BooleanType(), True),
-        T.StructField("tags", T.ArrayType(T.StringType()), True),
-        T.StructField("genres", T.ArrayType(T.StringType()), True),
-        T.StructField("specs", T.ArrayType(T.StringType()), True),
         T.StructField("url", T.StringType(), True),
         T.StructField("reviews_url", T.StringType(), True),
+        T.StructField("tags", T.StringType(), True),
+        T.StructField("genres", T.StringType(), True),
+        T.StructField("specs", T.StringType(), True),
     ])
 
-    # Turns payload into DF from the schema, it then unpacks using the alias
     return postgres_df.select(
         F.from_json(F.col("payload"), games_schema).alias("data")
     ).select("data.*")
@@ -109,6 +107,21 @@ def transform_games(spark,games_df):
     # Necessary confirm for coalesce logic
     spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
 
+    for col_name in ["tags", "genres", "specs"]:
+            # F.translate is bulletproof. It universally deletes these 4 characters without regex confusion.
+            cleaned = F.translate(F.col(col_name), "[]'\"", "")
+            trimmed = F.trim(cleaned)
+
+            games_df = games_df.withColumn(
+                col_name,
+                F.when(
+                    trimmed.isNull() | (trimmed == "") | (trimmed.ilike("null")),
+                    F.array().cast(T.ArrayType(T.StringType()))
+                ).otherwise(
+                    # Splits on commas and strips any whitespace around them
+                    F.array_remove(F.split(trimmed, r"\s*,\s*"), "")
+                )
+            )
     # Nulls invalid data, all "free" values are turned to decimal
     clean_price = F.regexp_replace(F.col("price"), r"[^0-9.]", "")
     games_df = games_df.withColumn(
@@ -142,6 +155,8 @@ def transform_games(spark,games_df):
             F.to_date(F.col("release_date"), "dd.MM.yyyy")
         )
     )
+    games_df = games_df.withColumn("release_date", F.col("release_date").cast(T.StringType()))
+    games_df = games_df.withColumn("price", F.col("price").cast(T.StringType()))
 
     #Further filtering, deleting duplicate and null entries
     games_df = games_df.withColumn("id", F.trim(F.col("id")))
@@ -190,19 +205,21 @@ def main():
         games_df = payload_to_table(postgres_df)
         games_df = transform_games(spark,games_df)
 
-        #Write "games" to BigQuery
+        # Write "games" to BigQuery
         games_df.write \
             .format("bigquery") \
             .option("table", f"{PROJECT_ID}.{BQ_DATASET}.games") \
             .option("temporaryGcsBucket", BUCKET_NAME) \
+            .option("intermediateFormat", "orc") \
             .mode("overwrite") \
             .save()
 
-        #Write "reviews" to BigQuery
+        # Write "reviews" to BigQuery
         reviews_df.write \
             .format("bigquery") \
             .option("table", f"{PROJECT_ID}.{BQ_DATASET}.reviews") \
             .option("temporaryGcsBucket", BUCKET_NAME) \
+            .option("intermediateFormat", "orc") \
             .mode("overwrite") \
             .save()
 

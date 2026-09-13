@@ -4,6 +4,7 @@
 *.csv
 
 # Data directories
+*jar
 
 **/raw/
 # Local .terraform directories (plugins and downloaded modules)
@@ -252,3 +253,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.bruin.yml
