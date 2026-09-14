@@ -87,25 +87,9 @@ graph LR
 
 `fct_reviews` joins to `dim_games` and `dim_users` on their respective surrogate keys, forming a standard star schema over `steam_analytics`.
 
-## Deployment & Operations
-
-Provision infrastructure:
-
-```bash
-cd terraform/
-terraform init
-terraform apply
-```
-
-Trigger pipeline orchestration:
-
-```bash
-kestra flow execute steam_pipeline.ingest_and_model
-```
-
-Tear down all cloud resources:
-
-```bash
-cd terraform/
-terraform destroy
-```
+### Implementation Status
+- [x] Infrastructure provisioning (Terraform)
+- [x] Cloud storage & Postgres ingestion
+- [x] PySpark transformation on Dataproc
+- [x] dbt modeling & automated testing
+- [ ] End-to-end Kestra orchestration (Pending)
