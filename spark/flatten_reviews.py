@@ -77,7 +77,7 @@ def safe_parse(line):
         parsed = ast.literal_eval(line)
         # If the record isn't corrupted it returns the data
         return parsed if isinstance(parsed, dict) else None
-    except Exception:
+    except (ValueError, SyntaxError):
         return None
 
 
@@ -233,6 +233,7 @@ def main():
         print("ERROR:")
         traceback.print_exc()
         print("=" * 50 + "\n")
+        raise
 
     finally:
         spark.stop()
