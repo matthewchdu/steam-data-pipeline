@@ -168,6 +168,12 @@ resource "google_sql_user" "users" {
   password = "root"
 }
 
+# Generates .env for Docker Compose
+resource "local_file" "kestra_env" {
+  content  = "SECRET_GCP_CREDS='${base64decode(google_service_account_key.kestra_sa_key.private_key)}'\n"
+  filename = "${path.module}/../.env"
+}
+
 output "cloud_sql_ip" {
   value       = google_sql_database_instance.postgres.public_ip_address
   description = "The public IP address of the Cloud PostgreSQL DB"
