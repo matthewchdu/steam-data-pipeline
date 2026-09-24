@@ -1,10 +1,8 @@
 # Steam Review Analytics Pipeline
 
-## System Overview
+Steam review data ships as messy, semi-structured JSON blobs with no analytical schema, making basic questions like "how does review sentiment vary by genre" impossible to answer without a proper warehouse. This pipeline pulls relational game metadata from Cloud SQL and ~1.3GB of nested review data from GCS, cleans and flattens both with PySpark on Dataproc, and models the result into a BigQuery star schema via dbt, with Kestra orchestrating the whole run end to end.
 
-This pipeline ingests relational Steam game metadata and unstructured, deeply nested Steam review data, normalizes both through a distributed compute layer, and models the result into a BigQuery star schema for analytical querying. Infrastructure provisioning, batch compute, warehouse transformation, and orchestration are each isolated as independently deployable, ephemeral components.
-
-## Architecture Diagram
+## Architecture & Data Flow
 
 ```mermaid
 graph LR
@@ -18,106 +16,34 @@ graph LR
     K -.-> E
 ```
 
-## Prerequisites
+Everything lives inside GCP once provisioned, so Dataproc reads game metadata over an internal JDBC connection to Cloud SQL instead of tunneling out to a local Postgres instance, which removes a real bottleneck when a single Spark job is doing 7.8M row-level lookups. Raw review JSON sits in GCS until Dataproc pulls it directly into RDDs, flattens and casts it, and writes partitioned staging tables into `bronze_dataset`. dbt then reads and writes entirely within BigQuery, so the transformation layer never leaves the warehouse. Kestra sits outside the data path entirely, only holding to it via API calls to spin Dataproc up, submit the job, trigger dbt, and tear the cluster down.
 
-Before you begin, make sure you have:
+## Pipeline Performance & Scale
 
-- A GCP project with billing enabled, and the `gcloud` CLI authenticated (`gcloud auth application-default login`)
-- [Terraform](https://developer.hashicorp.com/terraform/install) installed locally
-- [Docker](https://docs.docker.com/get-docker/) and Docker Compose (used to run Kestra OSS)
-- Python 3.10+, with the following packages installed for the local setup scripts:
+| Metric | Value |
+|---|---|
+| Raw dataset size | ~1.3 GB (`steam_reviews.json.gz`) |
+| Raw review records | 7.79M |
+| Clean records loaded (`fct_reviews`) | 6.87M |
+| Games loaded (`dim_games`) | 32K |
+| Unique users loaded (`dim_users`) | 2.56M |
+| Dataproc job runtime | ~6 min (single `e2-standard-4` node) |
+| Total flow runtime (Dataproc + BigQuery + dbt) | 6m 04s |
+| Compute cost per full run | < $0.05 |
 
-  ```bash
-  pip install google-cloud-storage psycopg2-binary requests
-  ```
+## Engineering Challenges & Workarounds
 
-- **The raw dataset is not included in this repository and must be downloaded manually.** Download `steam_reviews.json.gz` (~1.3 GB) and `steam_games.json.gz` from the [UCSD Steam Review dataset (McAuley Lab)](https://cseweb.ucsd.edu/~jmcauley/datasets.html#steam_data) and place both files in the `raw/` directory before running setup:
+**Parsing the McAuley dataset.** The raw review file isn't valid JSON — it's Python 2 `repr()` output, single-quoted stringified dicts with the occasional embedded byte string. Both BigQuery's native JSON loader and standard `json.loads` choke on it immediately. The fix was mapping each line through `ast.literal_eval` inside the Spark RDD instead of `json.loads`, wrapped in a try/except so a single malformed record gets dropped and logged rather than killing the whole distributed job. Roughly 900K of the 7.79M raw rows never made it to `fct_reviews` — most of it duplicate reviews and a smaller set of records that failed `literal_eval` outright.
 
-  ```
-  raw/
-  ├── steam_games.json.gz
-  └── steam_reviews.json.gz
-  ```
+**Single-node Dataproc, on purpose.** The cluster is one `e2-standard-4` node, created right before the job submits and torn down the moment it finishes — no standing cluster, no multi-node shuffle. At this data volume (a few GB post-flatten), the coordination overhead of a multi-node cluster costs more in shuffle and network time than it saves in parallelism, so single-node keeps both runtime and cost down. The tradeoff is real: this doesn't scale past a few times the current volume without re-architecting, but for a bounded, on-demand batch job it's the cheaper and simpler option, at under $0.05 compute per run.
 
-## Component Specifications & Decisions
+**JDBC driver, resolved not vendored.** The Postgres JDBC driver (`org.postgresql:postgresql:42.7.3`) isn't checked into the repo or staged in GCS as a `.jar`. It's pulled by its Maven coordinate at job submission time, which keeps the repo free of binary artifacts and means driver version bumps are a one-line change instead of a re-upload.
 
-### 1. Infrastructure as Code (Terraform)
+**Kestra OSS has no secrets UI.** Kestra OSS doesn't ship a secrets manager in its web UI, so there's no clean place to store a GCP service account key without it ending up in a flow YAML in plaintext. The workaround is passing the raw JSON contents of the service account key into Docker Compose as an environment variable (`SECRET_GCP_CREDS`), read by Kestra at container start. It's a real gap in the OSS tier — the Enterprise edition has a proper secrets backend — and this approach only holds up because the `.env` file is git-ignored and the box running Compose isn't multi-tenant.
 
-**Implementation**
-- Provisions a Cloud SQL PostgreSQL 14 instance, a GCS bucket with a 30-day lifecycle policy for automatic deletion of temporary raw data, two BigQuery datasets (`bronze_dataset` for staging and `prod_dataset` for the modeled star schema), and a dedicated least-privilege IAM service account.
-- On `apply`, Terraform writes two files to the repository root: `SERVICE_ACC_KEY.json` (the service account key) and `config.json` (the dynamic Cloud SQL public IP, bucket name, and project ID). Both are git-ignored and consumed by the setup scripts below.
+**Incremental modeling in dbt.** `fct_reviews` is partitioned by review date and materialized incrementally rather than as a full rebuild, since re-scanning 6.87M historical rows on every run wastes slots for no reason once the table is past its first load. The incremental logic filters `bronze_dataset` staging rows to just the max partition already loaded, so each run only processes what Dataproc wrote in that batch. Range and not-null tests (`playtime_forever >= 0`, non-null surrogate keys) run as part of `dbt test` in CI, not just at run time, so a bad upstream batch fails the PR before it touches `prod_dataset`.
 
-**Configuration**
-- Copy the example variables file and fill in your own project ID and region:
-
-  ```bash
-  cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-  ```
-
-- **Keep `region = "us-central1"`.** The Dataproc batch job is invoked against `us-central1` in the orchestration flow; deploying other resources in a different region will introduce cross-region egress latency (and cost) between Cloud SQL, GCS, and Dataproc.
-
-**Design Rationale**
-- Declarative resource management ensures reproducible environments across deployments.
-- `terraform destroy` enables full, automated teardown, eliminating idle cloud compute costs between runs.
-
-### 2. Source Ingestion & Storage
-
-**Implementation**
-- Relational game metadata (`steam_games.json.gz`) is loaded into Cloud SQL for PostgreSQL.
-- Unstructured review data (`steam_reviews.json.gz`, ~1.3 GB nested JSON) is uploaded to the GCS raw bucket by `setup_pipeline.py`.
-
-**Design Rationale**
-- Hosting PostgreSQL within GCP (Cloud SQL) rather than locally in Docker keeps the entire network topology inside the cloud provider.
-- This eliminates VPN/tunneling latency and external network ingress bottlenecks during distributed compute jobs.
-
-### 3. Heavy Compute Layer (PySpark on Dataproc)
-
-**Implementation**
-- An ephemeral, single-node Dataproc cluster (`e2-standard-4`) is created on demand by the orchestration flow, ingests raw nested JSON from GCS, and pulls relational metadata from Cloud SQL via JDBC.
-- The job flattens nested structures, casts types, handles malformed timestamps, and writes partitioned staging tables to `bronze_dataset` in BigQuery.
-- The Postgres JDBC driver is **not** vendored as a `.jar` in this repository or in GCS — it's resolved dynamically at job submission time via its Maven coordinate (`org.postgresql:postgresql:42.7.3`).
-- The cluster is explicitly torn down by the flow on both success and failure, so no compute is left running between runs.
-
-**Design Rationale**
-- Distributed Spark compute is decoupled from the warehouse to absorb compute-heavy JSON array exploding and schema normalization before loading.
-- This avoids expensive BigQuery slot contention and un-optimized warehouse queries.
-
-### 4. Analytics Modeling & Quality (dbt + BigQuery)
-
-**Implementation**
-- Transforms `bronze_dataset` staging data into a star schema in `prod_dataset`: `fct_reviews` (review metrics, engagement, votes; partitioned by date, materialized incrementally) plus `dim_games` (developer, publisher, genre, pricing) and `dim_users`.
-- Enforces automated constraints via `schema.yaml`, including unique keys, not-null constraints, and range assertions (e.g. `playtime_forever >= 0`).
-
-**Design Rationale**
-- Incremental materialization avoids full table scans on historical reviews.
-- In-warehouse SQL modeling separates extract/load transformations from business logic.
-
-### 5. Orchestration (Kestra OSS)
-
-**Implementation**
-- Kestra runs locally via Docker Compose and executes an end-to-end DAG: detects new objects in GCS, provisions the ephemeral Dataproc cluster described above, submits the PySpark job, runs `dbt run` and `dbt test`, tears the cluster down, and logs execution status.
-- **Secret handling:** because Kestra OSS has no web-UI secrets manager, GCP credentials are passed into the container via environment configuration rather than the UI. Populate a `SECRET_GCP_CREDS` entry in your `.env` file with the raw JSON contents of `SERVICE_ACC_KEY.json`:
-
-  ```bash
-  # .env
-  SECRET_GCP_CREDS='<paste the full contents of SERVICE_ACC_KEY.json here>'
-  ```
-
-- If you fork this repository, update the `clone_repository` task URL inside the flow YAML (`flows/dev.steam_data_pipeline.yaml`) to point at your fork — otherwise Kestra will pull the upstream repo's flow definition instead of your own.
-
-**Design Rationale**
-- Provides declarative, code-defined orchestration with deterministic state management.
-- Delivers automated retry and failure alerting across disparate GCP services.
-
-### 6. Continuous Integration (GitHub Actions)
-
-**Implementation**
-- Triggers automatically on pull requests to run Python linting/formatting (`ruff`) on scripts and syntax compilation checks (`dbt compile`) on warehouse models.
-
-**Design Rationale**
-- Enforces code quality and catches SQL/pipeline syntax errors prior to merging to production branches.
-
-## Data Schema
+## Data Warehouse Schema
 
 | Table | Type | Grain | Partitioning |
 |---|---|---|---|
@@ -125,59 +51,43 @@ Before you begin, make sure you have:
 | `dim_games` | Dimension | One row per game (developer, publisher, genre, pricing) | Not partitioned |
 | `dim_users` | Dimension | One row per reviewing user | Not partitioned |
 
-`fct_reviews` joins to `dim_games` and `dim_users` on their respective surrogate keys, forming a standard star schema over `prod_dataset`. Staging tables produced by the Dataproc job land in `bronze_dataset`.
+`fct_reviews` joins to `dim_games` and `dim_users` on their respective surrogate keys. Staging tables produced by the Dataproc job land in `bronze_dataset`; dbt reads from there and writes the modeled star schema to `prod_dataset`.
 
-## Quickstart: Clone to Teardown
+## Quickstart
 
 ```bash
-# 1. Clone the repository
 git clone <your-fork-or-repo-url>
 cd steam-data-pipeline
 
-# 2. Download the raw dataset manually into raw/
-#    (steam_games.json.gz and steam_reviews.json.gz — see Prerequisites above)
+# download steam_games.json.gz and steam_reviews.json.gz from the
+# UCSD McAuley Lab Steam dataset into raw/
+mkdir -p raw
 
-# 3. Install local Python dependencies
 pip install google-cloud-storage psycopg2-binary requests
 
-# 4. Configure and provision infrastructure
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-# edit terraform.tfvars with your GCP project ID (keep region = "us-central1")
+# set your GCP project ID in terraform.tfvars — keep region = "us-central1",
+# the Dataproc job is hardcoded to run there
+
 cd terraform
 terraform init
 terraform apply
 cd ..
-# this writes SERVICE_ACC_KEY.json and config.json to the repo root
+# writes SERVICE_ACC_KEY.json and config.json to the repo root
 
-# 5. Seed Cloud SQL with game metadata
 python source_system/seed_metadata.py
-
-# 6. Upload raw reviews to GCS, inject runtime IDs into the flow YAML,
-#    and register the flow with Kestra via its REST API
 python setup_pipeline.py
 
-# 7. Start Kestra OSS
-#    First, create a .env file with SECRET_GCP_CREDS set to the contents
-#    of SERVICE_ACC_KEY.json (see Orchestration section above), then:
+# create .env with:
+# SECRET_GCP_CREDS='<contents of SERVICE_ACC_KEY.json>'
 docker compose up -d
 
-# 8. Trigger the flow
-#    Open the Kestra UI (default: http://localhost:8080) and execute
-#    dev.steam_data_pipeline, or trigger it via the REST API.
-#    The flow will provision Dataproc, run the PySpark job, load
-#    bronze_dataset, run dbt, and tear the Dataproc cluster down.
+# open http://localhost:8080 and trigger dev.steam_data_pipeline,
+# or fire it via the Kestra REST API
 
-# 9. Inspect the results in BigQuery
-#    fct_reviews / dim_games / dim_users live in <project_id>.prod_dataset
+# results land in <project_id>.prod_dataset:
+# fct_reviews / dim_games / dim_users
 
-# 10. Tear down all cloud infrastructure when finished
 cd terraform
 terraform destroy
 ```
-
-### Implementation Status
-- [x] Infrastructure provisioning (Terraform)
-- [x] Cloud storage & Cloud SQL ingestion
-- [x] PySpark transformation on Dataproc
-- [x] dbt modeling & automated testing
-- [x] End-to-end Kestra orchestration
