@@ -16,7 +16,7 @@ graph LR
     K -.-> E
 ```
 
-Everything lives inside GCP once provisioned, so Dataproc reads game metadata over an internal JDBC connection to Cloud SQL instead of tunneling out to a local Postgres instance, which removes a real bottleneck when a single Spark job is doing 7.8M row-level lookups. Raw review JSON sits in GCS until Dataproc pulls it directly into RDDs, flattens and casts it, and writes partitioned staging tables into `bronze_dataset`. dbt then reads and writes entirely within BigQuery, so the transformation layer never leaves the warehouse. Kestra sits outside the data path entirely, only holding to it via API calls to spin Dataproc up, submit the job, trigger dbt, and tear the cluster down.
+Everything is inside GCP once provisioned, so Dataproc clusters (orchestrated by Kestra) pull raw review JSON from the GCS bucket and turns them into Spark RDDs. This is so Spark can handle schema normalisation, flattening, and stage cleaned records into BigQuery bronze tables alongside game metadata ingested from Cloud SQL. dbt then handles dimensional modelling within BigQuery. All transformations are strictly in-warehouse. Kestra acts as a dedicated control plane which manages Dataproc lifecycles, job submissions and dbt execution via API calls.
 
 ## Pipeline Performance & Scale
 
@@ -27,63 +27,61 @@ Everything lives inside GCP once provisioned, so Dataproc reads game metadata ov
 | Clean records loaded (`fct_reviews`) | 6.87M |
 | Games loaded (`dim_games`) | 32K |
 | Unique users loaded (`dim_users`) | 2.56M |
-| Dataproc job runtime | ~6 min (single `e2-standard-4` node) |
+| Dataproc job runtime | ~1 min (single `e2-standard-4` node) |
 | Total flow runtime (Dataproc + BigQuery + dbt) | 6m 04s |
 | Compute cost per full run | < $0.05 |
 
 ## Engineering Challenges & Workarounds
 
-**Parsing the McAuley dataset.** The raw review file isn't valid JSON — it's Python 2 `repr()` output, single-quoted stringified dicts with the occasional embedded byte string. Both BigQuery's native JSON loader and standard `json.loads` choke on it immediately. The fix was mapping each line through `ast.literal_eval` inside the Spark RDD instead of `json.loads`, wrapped in a try/except so a single malformed record gets dropped and logged rather than killing the whole distributed job. Roughly 900K of the 7.79M raw rows never made it to `fct_reviews` — most of it duplicate reviews and a smaller set of records that failed `literal_eval` outright.
+**Parsing Professor McAuley's Steam dataset.** The raw files themselves are not valid JSON. Instead, they are formatted as Python 2 `repr()` output. This is characterised by single-quoted, stringified dicts with the occasional embedded byte string, and prefixed `u` to indicate the text is Unicode. The standard `json.loads` and BigQuery's JSON loader cannot parse this. To fix this, I mapped each line using `ast.literal_eval` inside of a Spark RDD. This was wrapped in a `try/except` block so that malformed records are dropped and don't crash the job. Roughly 900K of the 7.79M raw rows aren't in `fct_reviews` because they were either empty review texts, duplicates, or they failed `literal_eval` parsing.
 
-**Single-node Dataproc, on purpose.** The cluster is one `e2-standard-4` node, created right before the job submits and torn down the moment it finishes — no standing cluster, no multi-node shuffle. At this data volume (a few GB post-flatten), the coordination overhead of a multi-node cluster costs more in shuffle and network time than it saves in parallelism, so single-node keeps both runtime and cost down. The tradeoff is real: this doesn't scale past a few times the current volume without re-architecting, but for a bounded, on-demand batch job it's the cheaper and simpler option, at under $0.05 compute per run.
+**Single-node Dataproc, on purpose.** The cluster is made of a single `e2-standard-4` node, ephemerally created to complete the Spark job and then immediately destroyed. I used only a single node for the cluster because at this data volume (a few GB), the co-ordination of a multi-node cluster costs more in shuffle and network time than it saves. A single node for this job kept runtime and costs down. At under $0.05 compute per run, this is simple and cheap. If the data volume were to scale though, multi-node clusters would be more appropriate.
 
-**JDBC driver, resolved not vendored.** The Postgres JDBC driver (`org.postgresql:postgresql:42.7.3`) isn't checked into the repo or staged in GCS as a `.jar`. It's pulled by its Maven coordinate at job submission time, which keeps the repo free of binary artifacts and means driver version bumps are a one-line change instead of a re-upload.
+**JDBC driver resolves.** Originally, the `org.postgresql:postgresql:42.7.3` .jar file was uploaded to GCS manually. However, I found it better to pull the file from the Maven repository using its coordinates. I did this because it means that there is no permanent .jar file in the GCS storage bucket as overhead. This does come at the trade-off that there is an extra 5-10 second latency in the Spark job from pulling this file, but because it also makes for a more seamless IaC experience, I believe that this cost is worth it. 
 
-**Kestra OSS has no secrets UI.** Kestra OSS doesn't ship a secrets manager in its web UI, so there's no clean place to store a GCP service account key without it ending up in a flow YAML in plaintext. The workaround is passing the raw JSON contents of the service account key into Docker Compose as an environment variable (`SECRET_GCP_CREDS`), read by Kestra at container start. It's a real gap in the OSS tier — the Enterprise edition has a proper secrets backend — and this approach only holds up because the `.env` file is git-ignored and the box running Compose isn't multi-tenant.
+**Kestra OSS has no secrets UI.** Kestra doesn't contain a secrets manager in the web UI, this means that there is no clean place to store a GCP service account key without placing it in plaintext in the flow YAML. To fix this, using `main.tf` I generated a `.env` file which contains the service account key. I did this to pass it as an environment variable in Docker Compose, which is read by Kestra. This approach isn't scalable safely in environments where other users can inspect container environment variables (e.g. an enterprise environment), this is the cost of not using Kestra Enterprise Edition.
 
-**Incremental modeling in dbt.** `fct_reviews` is partitioned by review date and materialized incrementally rather than as a full rebuild, since re-scanning 6.87M historical rows on every run wastes slots for no reason once the table is past its first load. The incremental logic filters `bronze_dataset` staging rows to just the max partition already loaded, so each run only processes what Dataproc wrote in that batch. Range and not-null tests (`playtime_forever >= 0`, non-null surrogate keys) run as part of `dbt test` in CI, not just at run time, so a bad upstream batch fails the PR before it touches `prod_dataset`.
+**In-warehouse dimensional modelling and test gating.** `fct_reviews` joins staged review records with game metadata and user dimensions into a star schema. To verify that transformations are executed correctly, `dbt build` executes models and data tests in dependency order within Kestra. If the tests fail (e.g. `hours >= 0`, or surrogate keys are null), modelling halts before corrupt records can be queried in production datasets during analysis. Python formatting and syntax are enforced using GitHub Actions CI via Ruff before the code reaches Kestra.
 
 ## Data Warehouse Schema
 
-| Table | Type | Grain | Partitioning |
+| Table | Type | Grain | Materialisation |
 |---|---|---|---|
-| `fct_reviews` | Fact | One row per review (metrics, engagement, votes) | Partitioned by review date; incremental materialization |
-| `dim_games` | Dimension | One row per game (developer, publisher, genre, pricing) | Not partitioned |
-| `dim_users` | Dimension | One row per reviewing user | Not partitioned |
+| `fct_reviews` | Fact | One row per review (metrics, engagement, votes) | Table (full refresh in dbt build) |
+| `dim_games` | Dimension | One row per game (developer, publisher, genre, pricing) | Table |
+| `dim_users` | Dimension | One row per reviewing user | Table |
 
 `fct_reviews` joins to `dim_games` and `dim_users` on their respective surrogate keys. Staging tables produced by the Dataproc job land in `bronze_dataset`; dbt reads from there and writes the modeled star schema to `prod_dataset`.
 
-## Quickstart
+## Set-up
 
 ```bash
-git clone <your-fork-or-repo-url>
+git clone https://github.com/matthewchdu/steam-data-pipeline.git
 cd steam-data-pipeline
-
-# download steam_games.json.gz and steam_reviews.json.gz from the
-# UCSD McAuley Lab Steam dataset into raw/
-mkdir -p raw
 
 pip install google-cloud-storage psycopg2-binary requests
 
-cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-# set your GCP project ID in terraform.tfvars — keep region = "us-central1",
-# the Dataproc job is hardcoded to run there
+# Download steam_games.json.gz and steam_reviews.json.gz from the
+# UCSD McAuley Lab Steam dataset and place into raw/
+# https://cseweb.ucsd.edu/~jmcauley/datasets.html
+mkdir -p raw
 
+# Set Up and Apply Terraform
 cd terraform
 terraform init
 terraform apply
 cd ..
-# writes SERVICE_ACC_KEY.json and config.json to the repo root
 
-python source_system/seed_metadata.py
-python setup_pipeline.py
-
-# create .env with:
-# SECRET_GCP_CREDS='<contents of SERVICE_ACC_KEY.json>'
+# Create Docker Container
 docker compose up -d
 
-# open http://localhost:8080 and trigger dev.steam_data_pipeline,
-# or fire it via the Kestra REST API
+# Seeds Cloud SQL Database
+python source_system/seed_metadata.py
+
+# Configures all variables, and uploads flow to Kestra
+python setup_pipeline.py
+
+# open http://localhost:8080 and trigger steam_data_pipeline
 
 # results land in <project_id>.prod_dataset:
 # fct_reviews / dim_games / dim_users
