@@ -1,13 +1,13 @@
 variable "region" {
   description = "Region, pick which one is best for you"
   type = string
-  default = "ENTER YOUR OWN REGION"
+  # default = "ENTER YOUR OWN REGION"
 }
 
 variable "project_name" {
   description = "Use the name of your GCP project here"
   type = string
-  default = "ENTER YOUR OWN PROJECT NAME"
+  # default = "ENTER YOUR OWN PROJECT NAME"
 }
 
 variable "lifecycle_days" {
