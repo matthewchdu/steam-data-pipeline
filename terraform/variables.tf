@@ -1,12 +1,13 @@
 variable "region" {
   description = "Region, pick which one is best for you"
   type = string
-  default = "europe-west2"
+  default = "ENTER YOUR OWN REGION"
 }
+
 variable "project_name" {
   description = "Use the name of your GCP project here"
   type = string
-  default = "steam-data-pipeline-507614"
+  default = "ENTER YOUR OWN PROJECT NAME"
 }
 
 variable "lifecycle_days" {

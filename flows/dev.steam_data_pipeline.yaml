@@ -1,0 +1,77 @@
+id: steam_data_pipeline
+namespace: dev
+description: End-to-end orchestration for Steam data pipeline
+
+variables:
+#Replaced in setup_pipeline.py
+  project_id: "REPLACE_WITH_YOUR_PROJECT_ID"
+  bucket_name: "REPLACE_WITH_YOUR_BUCKET_NAME"
+  postgres_ip: "REPLACE_WITH_CLOUD_SQL_IP"
+
+tasks:
+#Creates the Dataproc Cluster
+  - id: create_dataproc_cluster
+    type: io.kestra.plugin.gcp.cli.GCloudCLI
+    projectId: "{{ vars.project_id }}"
+    serviceAccount: "{{ secret('GCP_CREDS') }}"
+    commands:
+      - gcloud dataproc clusters create steam-cluster --region=us-central1 --zone=us-central1-a --single-node --image-version=2.2-debian12 --master-machine-type=e2-standard-4 --master-boot-disk-type=pd-standard --master-boot-disk-size=50GB --max-idle=10m --service-account=steam-serv-acc@{{ vars.project_id }}.iam.gserviceaccount.com
+
+#Runs the spark job, dynamically downloading the jar file postgresql:42.7.3
+  - id: run_pyspark_job
+    type: io.kestra.plugin.gcp.cli.GCloudCLI
+    projectId: "{{ vars.project_id }}"
+    serviceAccount: "{{ secret('GCP_CREDS') }}"
+    commands:
+      - gcloud dataproc jobs submit pyspark gs://{{ vars.bucket_name }}/scripts/flatten_reviews.py --cluster=steam-cluster --region=us-central1 --properties=spark.jars.packages=org.postgresql:postgresql:42.7.3 -- {{ vars.project_id }} {{ vars.bucket_name }} bronze_dataset {{ vars.postgres_ip }}
+
+#Deletes Dataproc cluster asynchronously, so that the flow can immediately go to dbt build
+  - id: delete_dataproc_cluster
+    type: io.kestra.plugin.gcp.cli.GCloudCLI
+    projectId: "{{ vars.project_id }}"
+    serviceAccount: "{{ secret('GCP_CREDS') }}"
+    commands:
+      - gcloud dataproc clusters delete steam-cluster --region=us-central1 --quiet --async
+
+#Clones repo and dbt builds
+  - id: dbt_pipeline
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+    #Clones repo to get dbt files
+      - id: clone_repository
+        type: io.kestra.plugin.git.Clone
+        url: https://github.com/matthewchdu/steam-data-pipeline.git
+        branch: main
+
+    #dbt build
+      - id: dbt_build
+        type: io.kestra.plugin.dbt.cli.DbtCLI
+        runner: DOCKER
+        containerImage: ghcr.io/kestra-io/dbt-bigquery:latest
+        env:
+          GCP_CREDS_JSON: "{{ secret('GCP_CREDS') }}"
+          GCP_PROJECT_ID: "{{ vars.project_id }}"
+        commands:
+          - printf '%s' "$GCP_CREDS_JSON" > /tmp/sa.json
+          - cd steam_analytics
+          - dbt deps
+          - dbt build --profiles-dir ..
+        profiles: |
+          steam_analytics:
+            outputs:
+              dev:
+                type: bigquery
+                method: service-account
+                project: "{{ vars.project_id }}"
+                dataset: prod_dataset
+                keyfile: /tmp/sa.json
+            target: dev
+
+#If the flow fails, it deletes the cluster to avoid costs
+errors:
+  - id: cleanup_cluster_on_failure
+    type: io.kestra.plugin.gcp.cli.GCloudCLI
+    projectId: "{{ vars.project_id }}"
+    serviceAccount: "{{ secret('GCP_CREDS') }}"
+    commands:
+      - gcloud dataproc clusters delete steam-cluster --region=us-central1 --quiet --async

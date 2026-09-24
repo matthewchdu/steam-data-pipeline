@@ -3,7 +3,7 @@ version: 2
 sources:
   - name: bronze_dataset
     description: "Bronze tables processed by the spark job"
-    database: steam-data-pipeline-507614 
+    database: "REPLACE_WITH_YOUR_PROJECT_ID"
     schema: bronze_dataset
     tables:
       - name: games

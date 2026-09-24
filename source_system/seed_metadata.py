@@ -8,7 +8,10 @@ import psycopg2
 from pathlib import Path
 from psycopg2.extras import execute_values 
 
-IP = "34.173.54.255"
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+IP = config["cloud_sql_ip"]
 
 #Connects to Postgre database `steam_metadata` in the cloud
 def get_db_connection():

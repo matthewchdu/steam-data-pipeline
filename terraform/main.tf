@@ -97,27 +97,98 @@ resource "google_bigquery_dataset_iam_member" "bigquery_iam_prod" {
   
 }
 resource "google_project_iam_member" "dataproc_worker" {
+  #Execute Spark jobs
   project = var.project_name
   role    = "roles/dataproc.worker"
   member  = "serviceAccount:${google_service_account.account.email}"
 }
 
 resource "google_project_iam_member" "dataproc_admin" {
+  # Allows the service account to create and delete clusters
   project = var.project_name
   role    = "roles/dataproc.admin"
   member  = "serviceAccount:${google_service_account.account.email}"
 }
 
 resource "google_project_iam_member" "service_account_user" {
+  # Allows Kestra to attach service account to Dataproc
   project = var.project_name
   role    = "roles/iam.serviceAccountUser"
   member  = "serviceAccount:${google_service_account.account.email}"
 }
 
 resource "google_project_iam_member" "compute_admin" {
+  # Allows dataproc to provision and delete clusters
   project = var.project_name
   role    = "roles/compute.admin"
   member  = "serviceAccount:${google_service_account.account.email}"
+}
+
+resource "google_service_account_key" "kestra_sa_key" {
+  # Creates a service account key
+  service_account_id = google_service_account.account.name
+}
+
+resource "local_file" "service_account_json" {
+  # Converts key into base64
+  content  = base64decode(google_service_account_key.kestra_sa_key.private_key)
+  # Creates Service Account Key File in root
+  filename = "${path.module}/../SERVICE_ACC_KEY.json"
+}
+
+#Provisions a Postgre DB in GCP 
+resource "google_sql_database_instance" "postgres" {
+  name             = "steam-postgres"
+  database_version = "POSTGRES_14"
+  region           = var.region
+  
+  deletion_protection = false 
+
+  settings {
+    tier = "db-custom-1-4096"
+
+    ip_configuration {
+      ipv4_enabled = true
+      authorized_networks {
+        name  = "allow-all"
+        value = "0.0.0.0/0"
+      }
+    }
+  }
+}
+
+resource "google_sql_database" "steam_metadata" {
+  name     = "steam_metadata"
+  instance = google_sql_database_instance.postgres.name
+}
+
+resource "google_sql_user" "users" {
+  name     = "postgres"
+  instance = google_sql_database_instance.postgres.name
+  password = "root"
+}
+
+output "cloud_sql_ip" {
+  value       = google_sql_database_instance.postgres.public_ip_address
+  description = "The public IP address of the Cloud PostgreSQL DB"
+}
+
+# Collects project ID, bucket name, postgre SQL IP, and region into a config file
+resource "local_file" "pipeline_config" {
+  content = jsonencode({
+    project_id   = var.project_name
+    bucket_name  = google_storage_bucket.steam_data_bucket.name
+    cloud_sql_ip = google_sql_database_instance.postgres.public_ip_address
+    region       = var.region
+  })
+  filename = "${path.module}/../config.json"
+}
+
+#Upload flatten_reviews to scripts in the bucket
+resource "google_storage_bucket_object" "pyspark_script" {
+  name   = "scripts/flatten_reviews.py"
+  bucket = google_storage_bucket.steam_data_bucket.name
+  source = "${path.module}/../spark/flatten_reviews.py"
 }
 
 resource "google_project_service" "apis" {

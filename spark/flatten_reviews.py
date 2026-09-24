@@ -17,11 +17,10 @@ import traceback
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
 
-# Constant variables, must be changed
-BUCKET_NAME = "steam-data-pipeline-507614-steam-data-bucket"
-PROJECT_ID = "steam-data-pipeline-507614"
-BQ_DATASET = "bronze_dataset"
-IP = "34.173.54.255"
+PROJECT_ID = sys.argv[1]
+BUCKET_NAME = sys.argv[2]
+BQ_DATASET = sys.argv[3]
+IP = sys.argv[4]
 
 # Sets up spark for steam bronze
 def init_spark():
