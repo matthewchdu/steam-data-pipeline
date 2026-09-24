@@ -6,6 +6,7 @@
 # Data directories
 *.jar
 
+
 **/raw/
 # Local .terraform directories (plugins and downloaded modules)
 **/.terraform/*
