@@ -5,7 +5,7 @@ with source as (
 
 transformed as (
     select
-        id as product_id,
+        id as app_id,
         title,
         coalesce(developer,'Unknown Developer') as developer,
         round(cast(price as numeric), 2) as price,

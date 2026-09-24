@@ -13,15 +13,15 @@ transformed as (
         early_access as early_access_review,
         text as review_content,
         coalesce(array_length(regexp_extract_all(trim(text), r'\S+')), 0) as review_word_count,
-        round(hours,2) as playtime_hours,
+        coalesce(round(hours, 2), 0.0) as playtime_hours,
         
         case
+            when hours is null or hours = 0 then '0 / Not Recorded'
             when hours < 2 then 'Within Refund Window'
             when hours between 2 and 20 then 'Standard (2-20 Hours)'
             else 'Veteran (20+ Hours)'
-        end as playtime_tier,
+        end as playtime_tier
     from source
-    
 )
 
 select * from transformed

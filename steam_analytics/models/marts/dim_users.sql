@@ -22,7 +22,7 @@ transformed as (
             when games_owned < 10 then 'Casual (<10)'
             when games_owned between 10 and 100 then 'Core Gamer (10-100)'
             else 'Collector (100+)'
-        end as user_tier
+        end as library_size_tier
     from deduplicated_users
 )
 

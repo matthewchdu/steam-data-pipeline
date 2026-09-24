@@ -1,0 +1,21 @@
+services:
+  kestra:
+    image: kestra/kestra:latest
+    pull_policy: always
+    container_name: kestra
+    user: "root"
+    command: server local
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - kestra_storage:/app/storage
+      - kestra_data:/app/data
+
+volumes:
+  kestra_storage:
+    driver: local
+  kestra_data:
+    driver: local

@@ -96,6 +96,29 @@ resource "google_bigquery_dataset_iam_member" "bigquery_iam_prod" {
   member = "serviceAccount:${google_service_account.account.email}"
   
 }
+resource "google_project_iam_member" "dataproc_worker" {
+  project = var.project_name
+  role    = "roles/dataproc.worker"
+  member  = "serviceAccount:${google_service_account.account.email}"
+}
+
+resource "google_project_iam_member" "dataproc_admin" {
+  project = var.project_name
+  role    = "roles/dataproc.admin"
+  member  = "serviceAccount:${google_service_account.account.email}"
+}
+
+resource "google_project_iam_member" "service_account_user" {
+  project = var.project_name
+  role    = "roles/iam.serviceAccountUser"
+  member  = "serviceAccount:${google_service_account.account.email}"
+}
+
+resource "google_project_iam_member" "compute_admin" {
+  project = var.project_name
+  role    = "roles/compute.admin"
+  member  = "serviceAccount:${google_service_account.account.email}"
+}
 
 resource "google_project_service" "apis" {
   # enables APIs
@@ -104,7 +127,8 @@ resource "google_project_service" "apis" {
     "bigquerystorage.googleapis.com",
     "storage.googleapis.com",
     "dataproc.googleapis.com",
-    "storage.googleapis.com"
+    "storage.googleapis.com",
+    "compute.googleapis.com"
   ])
 
   project = var.project_name
